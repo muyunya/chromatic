@@ -30,6 +30,91 @@
 
 namespace chromatic::js {
 
+#ifdef CHROMATIC_DARWIN
+namespace {
+
+/// Size in memory of a Mach-O image.
+///
+/// The old code took the highest `vmaddr + vmsize` over the segments, which is
+/// an *absolute address*, not a length. Truncated into the `int` that
+/// ModuleInfo stores, it wrapped around: anything living at a high address came
+/// out as hundreds of megabytes, and `Memory.scanModule` then walked far past
+/// the module - slow enough to notice, and worse, returning matches that belong
+/// to other libraries.
+///
+/// Neither the highest segment end nor the overall span is usable for an image
+/// in the dyld shared cache: its segments are scattered across the cache, and
+/// its __LINKEDIT describes the whole cache (hundreds of MB) rather than itself.
+/// Measured for libSystem.B.dylib: __TEXT at 0x18e6b5000 (7 KB), __DATA_CONST at
+/// 0x1e87364d8, __LINKEDIT at 0x1fee98000 with vmsize 0x26760000.
+///
+/// So measure the run of segments that is contiguous with the image header,
+/// which is the mapping the header actually lives in. That is exact for a
+/// normal image (whose segments are laid out back to back) and degrades to the
+/// image's own __TEXT mapping for a shared-cache image.
+///
+/// __PAGEZERO is skipped: it is an unmapped 4 GB guard region, not part of the
+/// image, and counting it would put the start address at 0.
+uint64_t machoImageSize(const struct mach_header_64 *header) {
+  struct Segment {
+    uint64_t start;
+    uint64_t end;
+  };
+  constexpr size_t kMaxSegments = 64;
+  Segment segments[kMaxSegments];
+  size_t count = 0;
+
+  auto cmd = reinterpret_cast<const struct load_command *>(header + 1);
+  for (uint32_t i = 0; i < header->ncmds; i++) {
+    if (cmd->cmd == LC_SEGMENT_64) {
+      auto seg = reinterpret_cast<const struct segment_command_64 *>(cmd);
+      const bool isPageZero = std::strncmp(seg->segname, "__PAGEZERO", 10) == 0;
+      if (!isPageZero && seg->vmsize > 0 && count < kMaxSegments)
+        segments[count++] = {seg->vmaddr, seg->vmaddr + seg->vmsize};
+    }
+    cmd = reinterpret_cast<const struct load_command *>(
+        reinterpret_cast<const uint8_t *>(cmd) + cmd->cmdsize);
+  }
+  if (count == 0)
+    return 0;
+
+  // Segments are usually already ordered; insertion sort keeps this obvious and
+  // the count is tiny.
+  for (size_t i = 1; i < count; i++) {
+    Segment key = segments[i];
+    size_t j = i;
+    while (j > 0 && segments[j - 1].start > key.start) {
+      segments[j] = segments[j - 1];
+      j--;
+    }
+    segments[j] = key;
+  }
+
+  // Grow the run while the next segment starts within a page of where the
+  // previous one ended. 16 KiB covers both arm64 and x86_64 page sizes.
+  constexpr uint64_t kPageMask = 0x3fff;
+  uint64_t end = segments[0].end;
+  for (size_t i = 1; i < count; i++) {
+    if (segments[i].start > ((end + kPageMask) & ~kPageMask))
+      break; // gap: not part of the same mapping
+    if (segments[i].end > end)
+      end = segments[i].end;
+  }
+
+  return end - segments[0].start;
+}
+
+/// ModuleInfo::size is an int, so clamp rather than wrapping a pathological
+/// image into a negative length.
+int machoImageSizeAsInt(const struct mach_header_64 *header) {
+  const uint64_t size = machoImageSize(header);
+  constexpr uint64_t kIntMax = 0x7fffffffULL;
+  return static_cast<int>(size > kIntMax ? kIntMax : size);
+}
+
+} // namespace
+#endif
+
 std::string NativeProcess::getArchitecture() {
 #ifdef CHROMATIC_ARM64
   return "arm64";
@@ -126,19 +211,10 @@ std::vector<std::shared_ptr<ModuleInfo>> NativeProcess::enumerateModules() {
       continue;
 
     // Get the size from segments
-    uint64_t imageSize = 0;
+    int imageSize = 0;
     if (header->magic == MH_MAGIC_64) {
-      auto header64 = reinterpret_cast<const struct mach_header_64 *>(header);
-      auto cmd = reinterpret_cast<const struct load_command *>(header64 + 1);
-      for (uint32_t j = 0; j < header64->ncmds; j++) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-          auto seg = reinterpret_cast<const struct segment_command_64 *>(cmd);
-          if (seg->vmaddr + seg->vmsize > imageSize)
-            imageSize = seg->vmaddr + seg->vmsize;
-        }
-        cmd = reinterpret_cast<const struct load_command *>(
-            reinterpret_cast<const uint8_t *>(cmd) + cmd->cmdsize);
-      }
+      imageSize =
+          machoImageSizeAsInt(reinterpret_cast<const struct mach_header_64 *>(header));
     }
 
     std::string fullPath = imageName;
@@ -149,7 +225,7 @@ std::vector<std::shared_ptr<ModuleInfo>> NativeProcess::enumerateModules() {
 
     result.push_back(std::make_shared<ModuleInfo>(ModuleInfo{
         name, std::make_shared<NativePointer>(reinterpret_cast<uint64_t>(header)),
-                      static_cast<int>(imageSize), fullPath}));
+                      imageSize, fullPath}));
   }
 
 #elif defined(CHROMATIC_LINUX) || defined(CHROMATIC_ANDROID)
@@ -403,23 +479,14 @@ NativeProcess::findModuleByAddress(std::shared_ptr<NativePointer> address) {
       continue;
 
     uint64_t base = reinterpret_cast<uint64_t>(header);
-    uint64_t imageSize = 0;
+    int imageSize = 0;
 
     if (header->magic == MH_MAGIC_64) {
-      auto header64 = reinterpret_cast<const struct mach_header_64 *>(header);
-      auto cmd = reinterpret_cast<const struct load_command *>(header64 + 1);
-      for (uint32_t j = 0; j < header64->ncmds; j++) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-          auto seg = reinterpret_cast<const struct segment_command_64 *>(cmd);
-          if (seg->vmaddr + seg->vmsize > imageSize)
-            imageSize = seg->vmaddr + seg->vmsize;
-        }
-        cmd = reinterpret_cast<const struct load_command *>(
-            reinterpret_cast<const uint8_t *>(cmd) + cmd->cmdsize);
-      }
+      imageSize = machoImageSizeAsInt(
+          reinterpret_cast<const struct mach_header_64 *>(header));
     }
 
-    if (addr >= base && addr < base + imageSize) {
+    if (addr >= base && addr < base + static_cast<uint64_t>(imageSize)) {
       const char *imageName = _dyld_get_image_name(i);
       std::string fullPath = imageName ? imageName : "";
       std::string name = fullPath;
@@ -428,8 +495,7 @@ NativeProcess::findModuleByAddress(std::shared_ptr<NativePointer> address) {
         name = name.substr(pos + 1);
 
       return std::make_shared<ModuleInfo>(ModuleInfo{
-          name, std::make_shared<NativePointer>(base), static_cast<int>(imageSize),
-                        fullPath});
+          name, std::make_shared<NativePointer>(base), imageSize, fullPath});
     }
   }
   return nullptr;

@@ -26,6 +26,7 @@ struct SpinLock {
     while (flag.test_and_set(std::memory_order_acquire))
       ;
   }
+  bool try_lock() { return !flag.test_and_set(std::memory_order_acquire); }
   void unlock() { flag.clear(std::memory_order_release); }
 };
 
@@ -43,6 +44,9 @@ static SpinLock g_lock;
 static std::vector<HandlerEntry> g_handlers;
 static chromatic::js::internal::ExceptionCallbackId g_nextId = 1;
 static std::atomic<bool> g_enabled{false};
+/// Set only by the explicit enable()/disable() API, as opposed to a sub-system
+/// holding a reference.
+static std::atomic<bool> g_userEnabled{false};
 static std::atomic<int> g_refCount{0};
 
 // ─── Hex address formatting ───
@@ -96,6 +100,16 @@ chromatic::js::ExceptionType stringToExceptionType(const std::string &s) {
     return chromatic::js::ExceptionType::IllegalInstruction;
   return chromatic::js::ExceptionType::Unknown;
 }
+
+// The kernel hands signal handlers an 8-byte aligned ucontext_t even though
+// clang's alignment for the type is 16, so reading the machine context through
+// that pointer is formally a misaligned access. It is safe in practice - the
+// fields we touch are pointer sized and 8-byte aligned, and arm64 permits
+// unaligned access - but UBSan rejects it, which makes it impossible to run the
+// suite under -fsanitize=undefined. Those three accessors opt out of just that
+// check. (Measured: alignof(ucontext_t) == 16, kernel-supplied pointer % 16 == 8.)
+#define CHROMATIC_MISALIGNED_PLATFORM_CONTEXT                                 \
+  __attribute__((no_sanitize("alignment")))
 
 // ─── ExceptionContext platform helpers ───
 
@@ -226,14 +240,34 @@ static void forwardToOriginal(int sig, siginfo_t *info, void *ucontext,
 static void globalSignalHandler(int sig, siginfo_t *info, void *ucontext) {
   auto ctx = buildContextFromSignal(sig, info, ucontext);
 
-  // Dispatch through handler chain
-  g_lock.lock();
-  auto handlers = g_handlers;
-  g_lock.unlock();
+  // Dispatch through the handler chain.
+  //
+  // This runs in a signal handler, so it must not block and must not allocate:
+  //
+  //   * taking g_lock would deadlock outright if the signal interrupted a
+  //     thread that already holds it, so use try_lock and fall through to the
+  //     previous handler instead of spinning;
+  //   * copying g_handlers would allocate (it holds std::function objects), and
+  //     allocating inside a signal handler can deadlock in malloc if the signal
+  //     interrupted the same thread's allocator. Snapshot raw pointers into a
+  //     fixed-size stack buffer instead - no allocation.
+  constexpr size_t kMaxDispatchHandlers = 32;
+  const HandlerEntry *snapshot[kMaxDispatchHandlers];
+  size_t snapshotCount = 0;
 
-  for (auto &entry : handlers) {
-    if (entry.type == ctx->type) {
-      if (entry.callback(ctx) == chromatic::js::HandleAction::Handled)
+  if (g_lock.try_lock()) {
+    for (const auto &entry : g_handlers) {
+      if (snapshotCount == kMaxDispatchHandlers)
+        break;
+      snapshot[snapshotCount++] = &entry;
+    }
+    g_lock.unlock();
+  }
+
+  for (size_t i = 0; i < snapshotCount; i++) {
+    const HandlerEntry *entry = snapshot[i];
+    if (entry->type == ctx->type) {
+      if (entry->callback(ctx) == chromatic::js::HandleAction::Handled)
         return; // Resume with (possibly modified) ucontext
     }
   }
@@ -298,6 +332,7 @@ void removeHandlers() {
 
 namespace chromatic::js {
 
+CHROMATIC_MISALIGNED_PLATFORM_CONTEXT
 uint64_t ExceptionContext::getPc() const {
 #ifdef CHROMATIC_WINDOWS
   auto *ep = static_cast<EXCEPTION_POINTERS *>($platformContext);
@@ -320,6 +355,7 @@ uint64_t ExceptionContext::getPc() const {
 #endif
 }
 
+CHROMATIC_MISALIGNED_PLATFORM_CONTEXT
 void ExceptionContext::setPc(uint64_t newPc) {
 #ifdef CHROMATIC_WINDOWS
   auto *ep = static_cast<EXCEPTION_POINTERS *>($platformContext);
@@ -342,6 +378,7 @@ void ExceptionContext::setPc(uint64_t newPc) {
 #endif
 }
 
+CHROMATIC_MISALIGNED_PLATFORM_CONTEXT
 void ExceptionContext::setSingleStep(bool enable) {
 #ifdef CHROMATIC_WINDOWS
   auto *ep = static_cast<EXCEPTION_POINTERS *>($platformContext);
@@ -377,18 +414,40 @@ void ExceptionContext::setSingleStep(bool enable) {
 
 // ─── NativeExceptionHandler (JS-facing) ───
 
+namespace {
+
+/// Installs the handlers if they are not installed yet.
+void ensureHandlersInstalled() {
+  if (!g_enabled.exchange(true))
+    installHandlers();
+}
+
+/// Removes the handlers once nobody needs them any more.
+///
+/// The handlers stay installed while either the user asked for them
+/// (enable()) or a sub-system still holds a reference (refEnable()), which is
+/// what g_refCount counts.
+void maybeRemoveHandlers() {
+  if (g_userEnabled.load() || g_refCount.load() > 0)
+    return;
+  if (g_enabled.exchange(false))
+    removeHandlers();
+}
+
+} // namespace
+
 void NativeExceptionHandler::enable() {
-  if (g_enabled.exchange(true))
-    return; // already enabled
-  installHandlers();
+  g_userEnabled.store(true);
+  ensureHandlersInstalled();
 }
 
 void NativeExceptionHandler::disable() {
-  if (!g_enabled.exchange(false))
-    return; // already disabled
-  if (g_refCount.load() > 0)
-    return; // sub-systems still need it
-  removeHandlers();
+  g_userEnabled.store(false);
+  // Note: the old version cleared g_enabled and then bailed out when
+  // sub-systems still held a reference, which left the handlers installed but
+  // marked disabled - after that, disable() returned early forever and the
+  // handlers could never be removed.
+  maybeRemoveHandlers();
 }
 
 bool NativeExceptionHandler::isEnabled() { return g_enabled.load(); }
@@ -453,21 +512,15 @@ void unregisterHandler(ExceptionCallbackId id) {
 }
 
 void refEnable() {
-  if (g_refCount.fetch_add(1) == 0) {
-    if (!g_enabled.load()) {
-      g_enabled.store(true);
-      installHandlers();
-    }
-  }
+  g_refCount.fetch_add(1);
+  ensureHandlersInstalled();
 }
 
 void refDisable() {
-  if (g_refCount.fetch_sub(1) == 1) {
-    // Last sub-system released. If user didn't explicitly enable,
-    // we can remove handlers.
-    // (We keep them if user called enable() explicitly.)
-    // For simplicity, always keep handlers while g_enabled is true.
-  }
+  // Used to be an empty stub, so the handlers stayed installed for the rest of
+  // the process' life after the last sub-system released them.
+  if (g_refCount.fetch_sub(1) == 1)
+    maybeRemoveHandlers();
 }
 
 } // namespace internal
