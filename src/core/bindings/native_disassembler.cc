@@ -196,18 +196,19 @@ std::shared_ptr<InstructionAnalysis>
 NativeDisassembler::analyzeInstruction(std::shared_ptr<NativePointer> address) {
   uint64_t addr = address->value();
   if (addr == 0)
-    return std::make_shared<InstructionAnalysis>(InstructionAnalysis{false, false, false, std::make_shared<NativePointer>(0), false, 0});
+    return std::make_shared<InstructionAnalysis>(InstructionAnalysis{false, false, false, std::make_shared<NativePointer>(0), false, 0, false});
   auto code = reinterpret_cast<const uint8_t *>(addr);
 
   cs_insn *insn;
   size_t count = cs_disasm(cs_handle.handle, code, 16, addr, 1, &insn);
   if (count == 0)
-    return std::make_shared<InstructionAnalysis>(InstructionAnalysis{false, false, false, std::make_shared<NativePointer>(0), false, 0});
+    return std::make_shared<InstructionAnalysis>(InstructionAnalysis{false, false, false, std::make_shared<NativePointer>(0), false, 0, false});
 
   bool isBranch = false;
   bool isCall = false;
   bool isRelative = false;
   bool isPcRelative = false;
+  bool readsRipRelativeMemory = false;
   uint64_t target = 0;
 
   if (insn->detail) {
@@ -240,6 +241,7 @@ NativeDisassembler::analyzeInstruction(std::shared_ptr<NativePointer> address) {
                  x86.operands[i].mem.base == X86_REG_RIP) {
         target = addr + insn->size + x86.operands[i].mem.disp;
         isPcRelative = true;
+        readsRipRelativeMemory = true;
         break;
       }
     }
@@ -249,8 +251,10 @@ NativeDisassembler::analyzeInstruction(std::shared_ptr<NativePointer> address) {
   int size = insn->size;
   cs_free(insn, count);
 
-  return std::make_shared<InstructionAnalysis>(InstructionAnalysis{isBranch,          isCall,       isRelative,
-                             std::make_shared<NativePointer>(target), isPcRelative, size});
+  return std::make_shared<InstructionAnalysis>(
+      InstructionAnalysis{isBranch, isCall, isRelative,
+                          std::make_shared<NativePointer>(target), isPcRelative,
+                          size, readsRipRelativeMemory});
 }
 
 // ─── findXrefs — scan range for instructions referencing target ────

@@ -10,6 +10,7 @@
 #include <asmjit/core.h>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <stdexcept>
 
@@ -113,6 +114,69 @@ void generatePatchBytes(uint8_t *buf, uint64_t jumpTarget) {
 
 // ─── Build relocated code ───
 
+#ifdef CHROMATIC_ARM64
+namespace {
+
+/// The condition that is true exactly when `cond` is false.
+///
+/// Relocating a conditional branch means emitting the *inverse* condition to hop
+/// over an absolute jump; there is no way to keep the original displacement, because
+/// it is encoded relative to the address the instruction used to live at.
+asmjit::a64::CondCode invertCond(asmjit::a64::CondCode cond) {
+  using namespace asmjit::a64;
+  switch (cond) {
+  case CondCode::kEQ: return CondCode::kNE;
+  case CondCode::kNE: return CondCode::kEQ;
+  case CondCode::kHS: return CondCode::kLO;
+  case CondCode::kLO: return CondCode::kHS;
+  case CondCode::kMI: return CondCode::kPL;
+  case CondCode::kPL: return CondCode::kMI;
+  case CondCode::kVS: return CondCode::kVC;
+  case CondCode::kVC: return CondCode::kVS;
+  case CondCode::kHI: return CondCode::kLS;
+  case CondCode::kLS: return CondCode::kHI;
+  case CondCode::kGE: return CondCode::kLT;
+  case CondCode::kLT: return CondCode::kGE;
+  case CondCode::kGT: return CondCode::kLE;
+  case CondCode::kLE: return CondCode::kGT;
+  default: return CondCode::kAL;
+  }
+}
+
+/// Maps a `b.<cond>` mnemonic onto its condition code.
+bool condFromMnemonic(const std::string &mnemonic, asmjit::a64::CondCode &out) {
+  using namespace asmjit::a64;
+  static const std::pair<const char *, CondCode> kTable[] = {
+      {"b.eq", CondCode::kEQ}, {"b.ne", CondCode::kNE},
+      {"b.cs", CondCode::kHS}, {"b.hs", CondCode::kHS},
+      {"b.cc", CondCode::kLO}, {"b.lo", CondCode::kLO},
+      {"b.mi", CondCode::kMI}, {"b.pl", CondCode::kPL},
+      {"b.vs", CondCode::kVS}, {"b.vc", CondCode::kVC},
+      {"b.hi", CondCode::kHI}, {"b.ls", CondCode::kLS},
+      {"b.ge", CondCode::kGE}, {"b.lt", CondCode::kLT},
+      {"b.gt", CondCode::kGT}, {"b.le", CondCode::kLE},
+      {"b.al", CondCode::kAL},
+  };
+  for (const auto &entry : kTable) {
+    if (mnemonic == entry.first) {
+      out = entry.second;
+      return true;
+    }
+  }
+  return false;
+}
+
+/// True for the load-from-literal-pool forms, whose operand is an address baked into
+/// the instruction encoding.
+bool isLiteralLoad(const std::string &mnemonic) {
+  return mnemonic == "ldr" || mnemonic == "ldrsw" || mnemonic == "ldrb" ||
+         mnemonic == "ldrh" || mnemonic == "ldrsb" || mnemonic == "ldrsh" ||
+         mnemonic == "prfm";
+}
+
+} // namespace
+#endif
+
 void *buildRelocatedCode(uint64_t source, size_t minBytes,
                          size_t &bytesConsumed) {
   using namespace asmjit;
@@ -125,7 +189,41 @@ void *buildRelocatedCode(uint64_t source, size_t minBytes,
 #ifdef CHROMATIC_ARM64
   a64::Assembler a(&code);
 
+  // The patch overwrites minBytes rounded up to whole instructions, and a branch
+  // inside that region may point at another instruction in it. Such a target has to
+  // be redirected to the relocated copy: the original address now sits inside the
+  // 16-byte jump stub, so branching there executes the stub's own bytes. The region's
+  // end is needed before the first branch is emitted, hence this sizing pass.
+  size_t regionEnd = 0;
+  while (regionEnd < minBytes) {
+    auto insn = chromatic::js::NativeDisassembler::disassembleOne(
+        makePtr(source + regionEnd));
+    if (insn->size == 0)
+      throw std::runtime_error("Cannot disassemble at " +
+                               makePtr(source + regionEnd)->toString());
+    regionEnd += static_cast<size_t>(insn->size);
+  }
+
+  // Source offset -> label bound at the same point in the trampoline. Created on
+  // demand, so a forward branch can reference a label bound later.
+  std::map<size_t, asmjit::Label> labels;
+  auto labelAt = [&](size_t offset) {
+    auto found = labels.find(offset);
+    if (found != labels.end())
+      return found->second;
+    asmjit::Label label = a.newLabel();
+    labels.emplace(offset, label);
+    return label;
+  };
+  const auto targetIsInsideRegion = [&](uint64_t target) {
+    return target >= source && target < source + regionEnd;
+  };
+
   while (srcOffset < minBytes) {
+    auto pending = labels.find(srcOffset);
+    if (pending != labels.end())
+      a.bind(pending->second);
+
     auto addrPtr = makePtr(source + srcOffset);
     auto insn = chromatic::js::NativeDisassembler::disassembleOne(addrPtr);
     int insnSize = insn->size;
@@ -137,19 +235,113 @@ void *buildRelocatedCode(uint64_t source, size_t minBytes,
     if (analysis->isPcRelative) {
       uint64_t target = analysis->target->value();
       std::string mnemonic = insn->mnemonic;
+      uint32_t rawInsn = 0;
+      std::memcpy(&rawInsn, srcPtr + srcOffset, 4);
+      const bool local = targetIsInsideRegion(target);
 
+      asmjit::a64::CondCode cond;
       if (mnemonic == "b") {
-        a.mov(a64::x(16), target);
-        a.br(a64::x(16));
+        if (local) {
+          a.b(labelAt(static_cast<size_t>(target - source)));
+        } else {
+          a.mov(a64::x(16), target);
+          a.br(a64::x(16));
+        }
       } else if (mnemonic == "bl") {
-        a.mov(a64::x(16), target);
-        a.blr(a64::x(16));
+        if (local) {
+          a.bl(labelAt(static_cast<size_t>(target - source)));
+        } else {
+          a.mov(a64::x(16), target);
+          a.blr(a64::x(16));
+        }
       } else if (mnemonic == "adr" || mnemonic == "adrp") {
-        uint32_t rawInsn;
-        std::memcpy(&rawInsn, srcPtr + srcOffset, 4);
+        // Address computation, not control flow: the value lands in the register
+        // either way, and the target is not a label.
         uint32_t rd = rawInsn & 0x1F;
         a.mov(a64::x(rd), target);
+      } else if (condFromMnemonic(mnemonic, cond)) {
+        if (local) {
+          a.b(cond, labelAt(static_cast<size_t>(target - source)));
+        } else {
+          // Branch over an absolute jump when the condition is false.
+          asmjit::Label skip = a.newLabel();
+          a.b(invertCond(cond), skip);
+          a.mov(a64::x(16), target);
+          a.br(a64::x(16));
+          a.bind(skip);
+        }
+      } else if (mnemonic == "cbz" || mnemonic == "cbnz") {
+        // CBZ/CBNZ Rt, label. sf (bit 31) selects the register width. This used to be
+        // embedded verbatim, which kept a displacement relative to the *original*
+        // address: the trampoline then branched into its own padding and the host died
+        // on an undefined instruction.
+        uint32_t rt = rawInsn & 0x1F;
+        const bool is64 = (rawInsn & 0x80000000u) != 0;
+        const bool isZeroTest = mnemonic == "cbz";
+        if (local) {
+          asmjit::Label destination = labelAt(static_cast<size_t>(target - source));
+          if (is64) {
+            if (isZeroTest) a.cbz(a64::x(rt), destination);
+            else a.cbnz(a64::x(rt), destination);
+          } else {
+            if (isZeroTest) a.cbz(a64::w(rt), destination);
+            else a.cbnz(a64::w(rt), destination);
+          }
+        } else {
+          asmjit::Label skip = a.newLabel();
+          if (is64) {
+            if (isZeroTest) a.cbnz(a64::x(rt), skip);
+            else a.cbz(a64::x(rt), skip);
+          } else {
+            if (isZeroTest) a.cbnz(a64::w(rt), skip);
+            else a.cbz(a64::w(rt), skip);
+          }
+          a.mov(a64::x(16), target);
+          a.br(a64::x(16));
+          a.bind(skip);
+        }
+      } else if (mnemonic == "tbz" || mnemonic == "tbnz") {
+        // TBZ/TBNZ Rt, #bit, label. The bit index is split across the encoding, and it
+        // also decides the register width.
+        uint32_t rt = rawInsn & 0x1F;
+        uint32_t bit = ((rawInsn >> 26) & 0x20u) | ((rawInsn >> 19) & 0x1Fu);
+        const bool is64 = bit >= 32;
+        const bool isZeroTest = mnemonic == "tbz";
+        if (local) {
+          asmjit::Label destination = labelAt(static_cast<size_t>(target - source));
+          if (is64) {
+            if (isZeroTest) a.tbz(a64::x(rt), bit, destination);
+            else a.tbnz(a64::x(rt), bit, destination);
+          } else {
+            if (isZeroTest) a.tbz(a64::w(rt), bit, destination);
+            else a.tbnz(a64::w(rt), bit, destination);
+          }
+        } else {
+          asmjit::Label skip = a.newLabel();
+          if (is64) {
+            if (isZeroTest) a.tbnz(a64::x(rt), bit, skip);
+            else a.tbz(a64::x(rt), bit, skip);
+          } else {
+            if (isZeroTest) a.tbnz(a64::w(rt), bit, skip);
+            else a.tbz(a64::w(rt), bit, skip);
+          }
+          a.mov(a64::x(16), target);
+          a.br(a64::x(16));
+          a.bind(skip);
+        }
+      } else if (isLiteralLoad(mnemonic)) {
+        // A literal load reads memory at an address encoded in the instruction, so
+        // copying it would read from the wrong place. Refuse rather than emit code
+        // whose displacement points somewhere else.
+        throw std::runtime_error(
+            "Cannot relocate the literal load '" + mnemonic + "' at " +
+            addrPtr->toString() +
+            ": its address is encoded relative to the original instruction");
       } else {
+        // Everything else with an immediate operand - mov, add, sub, cmp and friends
+        // - carries a value, not an address, so copying the bytes is correct. The
+        // analysis cannot tell the two apart (it flags any instruction with an
+        // immediate operand), which is why the cases above are decided by mnemonic.
         a.embed(srcPtr + srcOffset, insnSize);
       }
     } else {
@@ -180,8 +372,12 @@ void *buildRelocatedCode(uint64_t source, size_t minBytes,
       uint64_t target = analysis->target->value();
       uint8_t firstByte = srcPtr[srcOffset];
 
-      if (firstByte == 0xE9) {
-        // JMP rel32 → absolute jmp
+      if (firstByte == 0xE9 || firstByte == 0xEB) {
+        // JMP rel32 / JMP rel8 → absolute jmp. The rel8 form used to fall through to
+        // the conditional-branch case below, which reads its condition from a byte
+        // 0xEB is not: the unconditional jump came out as JNO, i.e. "jump if the
+        // overflow flag is set", so it became a conditional branch on an unrelated
+        // flag.
         a.jmp(x86::ptr(x86::rip));
         a.embedUInt64(target);
       } else if (firstByte == 0xE8) {
@@ -206,7 +402,17 @@ void *buildRelocatedCode(uint64_t source, size_t minBytes,
         a.jmp(x86::ptr(x86::rip));
         a.embedUInt64(target);
         a.bind(skipLabel);
+      } else if (analysis->readsRipRelativeMemory) {
+        // Moving this instruction would leave its displacement pointing at whatever
+        // lies the same distance from the trampoline, so the relocated copy would
+        // read a different address than the original. Refuse instead of emitting a
+        // load from the wrong place.
+        throw std::runtime_error(
+            "Cannot relocate the RIP-relative memory access at " +
+            addrPtr->toString() +
+            ": its displacement is encoded relative to the original instruction");
       } else {
+        // Immediates that are plain values (mov, add, cmp and friends) move fine.
         a.embed(srcPtr + srcOffset, insnSize);
       }
     } else {

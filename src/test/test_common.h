@@ -47,6 +47,7 @@ extern bool shouldSkipSignalTests();
 // ── C functions for hooking/calling from JS ──
 
 extern "C" int chromatic_test_add(int a, int b);
+extern "C" int chromatic_test_guarded(int x);
 extern "C" int chromatic_test_mul(int a, int b);
 extern "C" int chromatic_test_sub(int a, int b);
 extern "C" void chromatic_test_set_global(int v);

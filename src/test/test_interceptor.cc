@@ -180,3 +180,26 @@ TEST_F(ChromaticTest, ContextDispose_AutoDetachHooks) {
   int result = chromatic_test_sub(50, 20);
   EXPECT_EQ(result, 30);
 }
+
+/// A target whose first instruction is a conditional branch. The relocator has to
+/// rewrite its displacement; copying the encoding verbatim leaves it relative to the
+/// address the instruction used to live at, so the trampoline branches into its own
+/// padding and the host dies on an undefined instruction rather than running the
+/// hook. Reproduced before the fix: EXC_BAD_INSTRUCTION with the program counter
+/// inside the JIT region, and both calls returning garbage.
+TEST_F(ChromaticTest, Interceptor_RelocatesConditionalBranch) {
+  std::string code = R"(
+    (() => {
+      const target = ptr(')" +
+                     ptrHex((void *)&chromatic_test_guarded) + R"(');
+      const listener = Interceptor.attach(target, { onEnter(args) {} });
+      const fn = new NativeFunction(target, 'int', ['int']);
+      const zero = fn(0);
+      const five = fn(5);
+      listener.detach();
+      if (zero !== -1) throw new Error('guarded(0) = ' + zero);
+      if (five !== 6) throw new Error('guarded(5) = ' + five);
+    })()
+  )";
+  EXPECT_TRUE(jsEval(code));
+}

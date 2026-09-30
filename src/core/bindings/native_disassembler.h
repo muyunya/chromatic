@@ -29,6 +29,12 @@ struct InstructionAnalysis {
   std::shared_ptr<NativePointer> target;
   bool isPcRelative;
   int size;
+  /// True when the instruction reads memory through RIP-relative addressing. Such an
+  /// instruction cannot be moved: its displacement is relative to where it used to
+  /// live, so the relocated copy would read a different address. Distinct from
+  /// isPcRelative, which is also set for plain immediate operands - those carry a
+  /// value rather than an address and move fine.
+  bool readsRipRelativeMemory;
 };
 
 /// Result of a cross-reference search.

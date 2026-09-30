@@ -23,6 +23,30 @@ bool shouldSkipSignalTests() { return g_skipSignalTests; }
 extern "C" CHROMATIC_NOINLINE int chromatic_test_add(int a, int b) {
   return a + b;
 }
+/// A hook target whose *first* instruction is a conditional branch.
+///
+/// Hand-written and naked so the prologue is exactly these instructions: a compiler
+/// is free to emit anything, and the relocator's behaviour depends on what sits in
+/// the first bytes of the function. See
+/// Interceptor_RelocatesConditionalBranch for what goes wrong without the rewrite.
+extern "C" __attribute__((naked, noinline)) int chromatic_test_guarded(int x) {
+#if defined(__aarch64__)
+  asm volatile("cbnz w0, 1f\n\t"
+               "mov w0, #-1\n\t"
+               "ret\n\t"
+               "1:\n\t"
+               "add w0, w0, #1\n\t"
+               "ret\n\t");
+#else
+  asm volatile("test %rdi, %rdi\n\t"
+               "jne 1f\n\t"
+               "mov $-1, %eax\n\t"
+               "ret\n\t"
+               "1:\n\t"
+               "lea 1(%rdi), %eax\n\t"
+               "ret\n\t");
+#endif
+}
 extern "C" CHROMATIC_NOINLINE int chromatic_test_mul(int a, int b) {
   return a * b;
 }
