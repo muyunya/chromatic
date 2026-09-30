@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <fmt/core.h>
+#include <fmt/format.h>
 #include <lzma.h>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
@@ -18,6 +19,18 @@ namespace chromatic::injectee {
 
 /// Exported symbol that fripack CLI patches after compilation.
 extern "C" EXPORT EmbeddedConfig g_embedded_config{};
+
+#ifdef __APPLE__
+/// Reserved, file-backed buffer that fripack writes the script into.
+///
+/// Declared only here, with the section attribute, so that clang does not warn
+/// about the attribute being applied to a redeclaration.
+///
+/// The initialiser is required: drop it and the linker turns the buffer into
+/// zerofill, which occupies no space in the file. See config.h.
+extern "C" EXPORT __attribute__((used, section("__DATA,__fripack")))
+unsigned char g_fripack_payload[CHROMATIC_FRIPACK_RESERVE] = {0};
+#endif
 
 EmbeddedConfigData parseEmbeddedConfig() {
   // Validate magic numbers

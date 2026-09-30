@@ -36,4 +36,28 @@ struct EmbeddedConfig {
 /// Handles magic validation, xz decompression, and JSON deserialization.
 EmbeddedConfigData parseEmbeddedConfig();
 
+#ifdef __APPLE__
+// ─── fripack payload buffer (Mach-O only) ─────────────────────────────────────
+//
+// On Mach-O, fripack writes the embedded script straight into the payload
+// binary instead of rewriting the Mach-O structure, so the buffer it writes
+// into has to exist in the file up front. fripack locates it by section name and
+// then fills in `data_size` / `data_offset`.
+//
+// Two things are load-bearing:
+//   * the buffer must be *file-backed*. The initialiser in config.cc is not
+//     decoration: without it the linker folds the buffer into zerofill, it takes
+//     no space in the file, and fripack has nowhere to write.
+//   * it has to land in the same segment as `g_embedded_config` (__DATA),
+//     because `data_offset` is a virtual-address delta between the two.
+//
+// ELF and PE do not need this: fripack appends a section to those instead.
+//
+// The buffer itself is defined in config.cc, where the section and visibility
+// attributes live.
+#ifndef CHROMATIC_FRIPACK_RESERVE
+#define CHROMATIC_FRIPACK_RESERVE (1024 * 1024)
+#endif
+#endif
+
 } // namespace chromatic::injectee
