@@ -474,12 +474,36 @@ void *buildTrampoline(DispatchFn onEnterFn, DispatchFn onLeaveFn,
   a.mov(a64::x(16), reinterpret_cast<uint64_t>(onEnterFn));
   a.blr(a64::x(16));
 
-  // Call onLeave dispatch (if provided)
+  // Call onLeave dispatch (if provided), after the function has actually run.
   if (onLeaveFn) {
+    // Call, not jump: the relocated prologue ends by jumping back into the function,
+    // and that function's own return lands here, which is the first moment a return
+    // value exists. The previous shape tail-jumped into the function *after* calling
+    // onLeave, so onLeave ran against the entry register state and reported whatever
+    // happened to be in x0 - the first argument - as the return value.
+    //
+    // The arguments have to be put back first: onEnter ran in between and its call
+    // clobbered x0..x8, so calling the function now would hand it whatever the
+    // callback left behind. Only the argument registers are restored - the rest are
+    // scratch by the ABI and the callback is free to have used them.
+    for (int i = 0; i <= 8; ++i) {
+      a.ldr(a64::x(i), a64::Mem(a64::sp, i * 8));
+    }
+    a.mov(a64::x(16), relocatedAddr);
+    a.blr(a64::x(16));
+
+    // Publish the result where the leave dispatcher reads it from: the saved x0 slot.
+    // x0 is loaded back from that same slot on the way out, so a replacement made by
+    // the callback takes effect without the callback having to know how this works.
+    a.str(a64::x(0), a64::Mem(a64::sp, 0));
+
     a.mov(a64::x(0), a64::sp);
     a.mov(a64::x(1), reinterpret_cast<uint64_t>(userData));
     a.mov(a64::x(16), reinterpret_cast<uint64_t>(onLeaveFn));
     a.blr(a64::x(16));
+
+    // Pick up a replacement, if the callback made one.
+    a.ldr(a64::x(0), a64::Mem(a64::sp, 0));
   }
 
   // Restore NZCV
@@ -497,9 +521,16 @@ void *buildTrampoline(DispatchFn onEnterFn, DispatchFn onLeaveFn,
   // Restore SP
   a.add(a64::sp, a64::sp, FRAME_SIZE);
 
-  // Jump to relocated code
-  a.mov(a64::x(16), relocatedAddr);
-  a.br(a64::x(16));
+  if (onLeaveFn) {
+    // The function already ran inside this frame, and x0 was restored from the saved
+    // slot above, so returning hands the caller the result (or its replacement).
+    a.ret(a64::x(30));
+  } else {
+    // Entered by a jump from the patched entry, so the caller's return address is
+    // still in x30 and the tail jump keeps the stack exactly as the function expects.
+    a.mov(a64::x(16), relocatedAddr);
+    a.br(a64::x(16));
+  }
 
 #else // x86_64
   x86::Assembler a(&code);
@@ -542,19 +573,53 @@ void *buildTrampoline(DispatchFn onEnterFn, DispatchFn onLeaveFn,
   a.mov(x86::rax, reinterpret_cast<uint64_t>(onEnterFn));
   a.call(x86::rax);
 
-  // Call onLeave dispatch (if provided)
+  // Call onLeave dispatch (if provided), after the function has actually run.
+  //
+  // The saved rax sits 14 slots above the register snapshot's base, which is the slot
+  // the leave dispatcher reads the return value from - the same slot the final pop
+  // restores into rax, so a replacement made by the callback takes effect.
+#ifdef CHROMATIC_WINDOWS
+  constexpr int kSnapshotAdjust = 0x28;
+#else
+  constexpr int kSnapshotAdjust = 0x8;
+#endif
+  constexpr int kSavedRaxOffset = 14 * 8;
   if (onLeaveFn) {
+    // Put the argument registers back before calling: onEnter ran in between and its
+    // call clobbered them, so the function would otherwise be handed whatever the
+    // callback left behind. Slot numbers are from the snapshot's base, where rax is
+    // 14 and the pushes below it run rcx, rdx, ..., r9, r8, rdi, rsi.
+    const auto snapshotSlot = [&](int slot) {
+      return x86::ptr(x86::rsp, kSnapshotAdjust + slot * 8);
+    };
+    a.mov(x86::rdi, snapshotSlot(8));
+    a.mov(x86::rsi, snapshotSlot(9));
+    a.mov(x86::rdx, snapshotSlot(12));
+    a.mov(x86::rcx, snapshotSlot(13));
+    a.mov(x86::r8, snapshotSlot(7));
+    a.mov(x86::r9, snapshotSlot(6));
+    a.mov(x86::rax, snapshotSlot(14));
+
+    // Call the function; rax comes back holding its result. A tail jump here, as this
+    // used to do, meant onLeave ran before the function and reported the entry state.
+    a.mov(x86::rax, relocatedAddr);
+    a.call(x86::rax);
+    a.mov(x86::ptr(x86::rsp, kSnapshotAdjust + kSavedRaxOffset), x86::rax);
+
 #ifdef CHROMATIC_WINDOWS
     a.mov(x86::rcx, x86::rsp);
-    a.add(x86::rcx, 0x28); // point back to the saved register snapshot
+    a.add(x86::rcx, kSnapshotAdjust); // point back to the saved register snapshot
     a.mov(x86::rdx, reinterpret_cast<uint64_t>(userData));
 #else
     a.mov(x86::rdi, x86::rsp);
-    a.add(x86::rdi, 0x8); // point back to saved regs
+    a.add(x86::rdi, kSnapshotAdjust); // point back to saved regs
     a.mov(x86::rsi, reinterpret_cast<uint64_t>(userData));
 #endif
     a.mov(x86::rax, reinterpret_cast<uint64_t>(onLeaveFn));
     a.call(x86::rax);
+
+    // Pick up a replacement, if the callback made one.
+    a.mov(x86::rax, x86::ptr(x86::rsp, kSnapshotAdjust + kSavedRaxOffset));
   }
 
   // Undo ABI-specific stack reservation.
@@ -582,9 +647,16 @@ void *buildTrampoline(DispatchFn onEnterFn, DispatchFn onLeaveFn,
   a.pop(x86::rax);
   a.popfq();
 
-  // Jump to relocated code (absolute indirect jump)
-  a.jmp(x86::ptr(x86::rip));
-  a.embedUInt64(relocatedAddr);
+  if (onLeaveFn) {
+    // The function already ran inside this frame, and rax was popped from the saved
+    // slot, so returning hands the caller the result (or its replacement).
+    a.ret();
+  } else {
+    // Jump to relocated code (absolute indirect jump): entered by a jump from the
+    // patched entry, the stack is untouched and the function sees it as the caller left it.
+    a.jmp(x86::ptr(x86::rip));
+    a.embedUInt64(relocatedAddr);
+  }
 #endif
 
   void *result = nullptr;

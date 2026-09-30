@@ -465,9 +465,14 @@ const listener = Interceptor.attach(target, {
   - `this.returnAddress`: 返回地址
 
 - `onLeave(retval)`:
-  - `retval`: 返回值（NativePointer）
+  - `retval`: 返回值（NativePointer），可用 `retval.replace(ptr(...))` 改写
   - `this.context`: CPU 上下文
-  - `this.returnValue`: 可修改的返回值
+  - `this.returnValue`: 与 `retval` 是同一个对象，用哪个改写都一样
+
+> **注意**：`onLeave` 是在原函数**返回之后**才调用的——引擎在原地调用原函数、拿到返回值，
+> 再回调。由此带来一个限制：如果目标函数**通过栈传递参数**（整型参数超过 8 个，或按值传递
+> 较大的结构体），这些参数会被读错，因为引擎的一帧位于调用者与函数之间。只使用 `onEnter`
+> 的 hook 不受影响。
 
 #### `listener.detach()`
 分离拦截器。

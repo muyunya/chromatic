@@ -203,3 +203,69 @@ TEST_F(ChromaticTest, Interceptor_RelocatesConditionalBranch) {
   )";
   EXPECT_TRUE(jsEval(code));
 }
+
+/// onLeave has to report what the function returned.
+///
+/// It used to be called from the same trampoline as onEnter, before the function had
+/// run at all, so the "return value" was whatever x0 happened to hold on entry - the
+/// first argument. add(100, 200) reported 100.
+TEST_F(ChromaticTest, Interceptor_OnLeaveSeesReturnValue) {
+  std::string code = R"(
+    (() => {
+      const target = ptr(')" +
+                     ptrHex((void *)&chromatic_test_add) + R"(');
+      let seen = null;
+      const listener = Interceptor.attach(target, {
+        onLeave(retval) { seen = retval; }
+      });
+      const fn = new NativeFunction(target, 'int', ['int', 'int']);
+      const result = fn(100, 200);
+      listener.detach();
+      if (result !== 300) throw new Error('call returned ' + result);
+      if (seen === null) throw new Error('onLeave never ran');
+      if (!seen.equals(ptr(300))) throw new Error('onLeave saw ' + seen + ', not 300');
+    })()
+  )";
+  EXPECT_TRUE(jsEval(code));
+}
+
+/// A replacement made in onLeave is what the caller receives. This is the point of
+/// having onLeave at all for a modifier: change what a function claims to return.
+TEST_F(ChromaticTest, Interceptor_OnLeaveCanReplaceReturnValue) {
+  std::string code = R"(
+    (() => {
+      const target = ptr(')" +
+                     ptrHex((void *)&chromatic_test_add) + R"(');
+      const listener = Interceptor.attach(target, {
+        onLeave(retval) { retval.replace(ptr(999)); }
+      });
+      const fn = new NativeFunction(target, 'int', ['int', 'int']);
+      const replaced = fn(1, 2);
+      listener.detach();
+      const untouched = fn(1, 2);
+      if (replaced !== 999) throw new Error('replacement did not reach the caller: ' + replaced);
+      if (untouched !== 3) throw new Error('detach left the hook in place: ' + untouched);
+    })()
+  )";
+  EXPECT_TRUE(jsEval(code));
+}
+
+/// The spelling the API documentation uses: this.returnValue is the handle on what
+/// the caller receives. It was documented and never implemented - the callback got
+/// `retval` and nothing else - so a script written from the docs silently did nothing.
+TEST_F(ChromaticTest, Interceptor_OnLeaveThisReturnValue) {
+  std::string code = R"(
+    (() => {
+      const target = ptr(')" +
+                     ptrHex((void *)&chromatic_test_mul) + R"(');
+      const listener = Interceptor.attach(target, {
+        onLeave(retval) { this.returnValue.replace(ptr(4242)); }
+      });
+      const fn = new NativeFunction(target, 'int', ['int', 'int']);
+      const result = fn(6, 7);
+      listener.detach();
+      if (result !== 4242) throw new Error('this.returnValue.replace did not take: ' + result);
+    })()
+  )";
+  EXPECT_TRUE(jsEval(code));
+}

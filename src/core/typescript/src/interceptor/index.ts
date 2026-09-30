@@ -83,12 +83,6 @@ export const Interceptor = {
     const onLeave = (cpuContextPtr: string) => {
       if (!callbacks.onLeave) return;
 
-      const ctx: InvocationContext = {
-        context: {} as any,
-        threadId: 0,
-        returnAddress: new NativePointer(0),
-      };
-
       const ctxPtr = new NativePointer(parseInt(cpuContextPtr, 16));
       const ptrSize = NativeProcess.pointerSize;
 
@@ -96,6 +90,13 @@ export const Interceptor = {
       const retval = retvalPtr.readPointer() as any as InvocationReturnValue;
       retval.replace = (value: NativePointerValue) => {
         retvalPtr.writePointer(ptr(value));
+      };
+
+      const ctx: InvocationContext = {
+        context: {} as any,
+        threadId: 0,
+        returnAddress: new NativePointer(0),
+        returnValue: retval,
       };
 
       try {

@@ -465,9 +465,16 @@ Parameters received by callback functions:
   - `this.returnAddress`: Return address
 
 - `onLeave(retval)`:
-  - `retval`: Return value (NativePointer)
-  - `this.context`: CPU context
-  - `this.returnValue`: Modifiable return value
+  - `retval`: the return value (NativePointer); call `retval.replace(ptr(...))` to change it
+  - `this.context`: the CPU context
+  - `this.returnValue`: the same object as `retval`; replacing through either name works
+
+> **Note**: `onLeave` runs after the original function has returned - the engine calls
+> the function in place, takes the result, then invokes the callback. One limitation
+> follows from that: a function taking arguments **on the stack** (more than eight
+> integer arguments, or a large struct passed by value) will read them from the wrong
+> place, because the engine's frame sits between the caller and the function. Hooks
+> that use only `onEnter` are unaffected.
 
 #### `listener.detach()`
 Detaches the interceptor.

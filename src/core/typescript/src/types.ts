@@ -122,6 +122,10 @@ export interface InvocationContext {
   context: CpuContext;
   threadId: number;
   returnAddress: NativePointer;
+  /// The result, in onLeave. Documented as the writable handle on what the caller
+  /// receives, and it is the same object the callback is passed as `retval`, so a
+  /// replacement made through either name has the same effect.
+  returnValue?: InvocationReturnValue;
 }
 
 export interface InvocationCallbacks {
