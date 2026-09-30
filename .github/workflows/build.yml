@@ -129,3 +129,50 @@ jobs:
         with:
           name: chromatic-injectee-${{ matrix.name }}
           path: artifacts/*
+
+  # Publishes the injectee so that consumers (e.g. fripack) can download a
+  # ready-made payload instead of building one. Assets are named
+  #   chromatic-injectee-<tag>-<platform>.<ext>
+  # where <platform> reuses fripack's vocabulary (macos-arm64, macos-x86_64,
+  # windows-x64, linux-x64, ...) so it can be referenced directly.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          tag="${GITHUB_REF_NAME}"
+          platform_name() {
+            case "$1" in
+              macos-x64) echo "macos-x86_64" ;;
+              *)         echo "$1" ;;
+            esac
+          }
+          for dir in artifacts/chromatic-injectee-*; do
+            name="$(basename "$dir")"
+            name="${name#chromatic-injectee-}"
+            ext=dylib
+            case "$name" in
+              windows-*)        ext=dll ;;
+              android-*|linux-*) ext=so ;;
+            esac
+            src="$(find "$dir" -type f | head -n 1)"
+            dest="release/chromatic-injectee-${tag}-$(platform_name "$name").${ext}"
+            cp "$src" "$dest"
+            echo "$dest"
+          done
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
