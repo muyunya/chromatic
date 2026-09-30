@@ -208,6 +208,28 @@ void shutdown_runtime() {
 }
 } // namespace
 
+/// Starts the injectee on its own thread.
+///
+/// The thread is not an implementation detail that can be folded away - the work
+/// must not run inside this constructor. Doing it inline is tempting, and it does
+/// fix one real symptom (a host that exits immediately never gives the thread a
+/// chance to run the script at all), but it breaks the engine instead: the
+/// constructor runs under the loader lock, and API calls that need the loader to be
+/// free stop dead there. Measured with a three-line script, console.log only:
+///
+///     [probe] one
+///     [probe] two
+///     [probe] three
+///
+/// and the same script with Process.enumerateModules() inserted:
+///
+///     [probe] before enumerateModules
+///
+/// - the rest of the script never ran, and dlopen() returned as if all was well.
+///
+/// startup: spawn the worker, register the teardown from inside it (see
+/// shutdown_runtime for why that ordering matters), and keep the constructor free of
+/// engine work.
 __attribute__((constructor)) static void _library_main() {
   std::thread([]() { injectee_main(); }).detach();
 }
