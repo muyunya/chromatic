@@ -18,6 +18,11 @@
 #include <unistd.h>
 #endif
 
+#ifdef CHROMATIC_DARWIN
+#include <mach/mach.h>
+#include <mach/vm_region.h>
+#endif
+
 namespace {
 
 uint64_t parseHexAddr(const std::string &s) {
@@ -114,6 +119,64 @@ static size_t getPageSize() {
 
 // ─── Protection helpers ───
 
+/// Reads the protection currently on the page containing `addr`.
+///
+/// Needed because the monitor has to put the page back the way it found it. Assuming
+/// read-write is wrong in both directions that matter: a read-only page comes back
+/// writable, and a page of code comes back non-executable, so the instruction the
+/// faulting thread is about to re-execute faults again - this time with no handler
+/// interested - and the process dies.
+///
+/// Runs at enable() time, never in the signal handler, so reading a file is fine.
+#ifdef CHROMATIC_WINDOWS
+// VirtualProtect reports the previous protection in its out parameter; nothing to do.
+#elif defined(CHROMATIC_DARWIN)
+static bool queryProtection(uint64_t addr, int &prot) {
+  vm_address_t regionAddr = static_cast<vm_address_t>(addr);
+  vm_size_t regionSize = 0;
+  vm_region_basic_info_data_64_t info;
+  mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object = MACH_PORT_NULL;
+  kern_return_t kr =
+      vm_region_64(mach_task_self(), &regionAddr, &regionSize,
+                   VM_REGION_BASIC_INFO_64,
+                   reinterpret_cast<vm_region_info_t>(&info), &infoCount,
+                   &object);
+  if (kr != KERN_SUCCESS)
+    return false;
+  prot = static_cast<int>(info.protection) &
+         (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+  return true;
+}
+#else
+static bool queryProtection(uint64_t addr, int &prot) {
+  FILE *maps = fopen("/proc/self/maps", "r");
+  if (!maps)
+    return false;
+  char line[512];
+  bool found = false;
+  while (fgets(line, sizeof(line), maps)) {
+    unsigned long start = 0, end = 0;
+    char perms[8] = {0};
+    if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3)
+      continue;
+    if (addr >= start && addr < end) {
+      prot = 0;
+      if (perms[0] == 'r')
+        prot |= PROT_READ;
+      if (perms[1] == 'w')
+        prot |= PROT_WRITE;
+      if (perms[2] == 'x')
+        prot |= PROT_EXEC;
+      found = true;
+      break;
+    }
+  }
+  fclose(maps);
+  return found;
+}
+#endif
+
 static void setProtection(uint64_t addr, size_t size, int prot) {
 #ifdef CHROMATIC_WINDOWS
   DWORD oldProt;
@@ -132,8 +195,16 @@ chromatic::js::HandleAction
 monitorSegvHandler(std::shared_ptr<chromatic::js::ExceptionContext> ctx) {
   uint64_t faultAddr = ctx->faultAddress;
 
-  // Scan all active monitors (lock-free read; g_monitors is stable during
-  // signal since the same thread holds any pending writes)
+  // The monitor table is an unordered_map and every monitor holds a vector of ranges,
+  // so walking them is only safe while no other thread is adding or removing a
+  // monitor - and a fault can land on any thread while another is in enable() or
+  // disable(). Both of those hold g_monMutex, so take it; with try_lock, because a
+  // signal handler must never block. If it is unavailable, the fault is simply left
+  // unhandled for whoever else registered for it.
+  std::unique_lock<std::mutex> lock(g_monMutex, std::try_to_lock);
+  if (!lock.owns_lock())
+    return chromatic::js::HandleAction::NotHandled;
+
   for (auto &[id, monitor] : g_monitors) {
     for (auto &range : monitor->ranges) {
       if (range.fired)
@@ -222,9 +293,9 @@ std::string NativeMemoryAccessMonitor::enable(
     range.fired = false;
 
 #ifdef CHROMATIC_WINDOWS
-    range.originalProt = PAGE_READWRITE;
+    range.originalProt = PAGE_READWRITE; // replaced below by the real value
 #else
-    range.originalProt = PROT_READ | PROT_WRITE;
+    range.originalProt = PROT_READ | PROT_WRITE; // fallback if the query fails
 #endif
 
     monitor->ranges.push_back(range);
@@ -236,7 +307,9 @@ std::string NativeMemoryAccessMonitor::enable(
                    &oldProt);
     monitor->ranges.back().originalProt = static_cast<int>(oldProt);
 #else
-    // We can't easily query old protection on POSIX, so assume RW
+    int originalProt = PROT_READ | PROT_WRITE;
+    queryProtection(pageBase, originalProt);
+    monitor->ranges.back().originalProt = originalProt;
     mprotect(reinterpret_cast<void *>(pageBase), totalSize, PROT_NONE);
 #endif
   }

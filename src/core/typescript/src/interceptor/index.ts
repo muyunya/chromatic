@@ -12,6 +12,27 @@ import type {
 const isArm64 = NativeProcess.architecture === 'arm64';
 
 /**
+ * Where each integer argument lives in the x86_64 register snapshot the trampoline
+ * pushes.
+ *
+ * The snapshot is pushed rax, rcx, rdx, rbx, rbp, rsi, rdi, r8 ... r15, so counting
+ * from its base the slots run r15 = 0, r14 = 1, r13 = 2, r12 = 3, r11 = 4, r10 = 5,
+ * r9 = 6, r8 = 7, rdi = 8, rsi = 9, rbp = 10, rbx = 11, rdx = 12, rcx = 13, rax = 14.
+ * The engine itself pins that layout down: the leave dispatcher reads the return value
+ * from slot 14, which is where rax lands under this reading and nowhere else.
+ *
+ * The table this replaces said `[7, 6, 3, 2, 8, 9]`, which is every entry one slot too
+ * low and calls r8 the first argument on both ABIs. On x86_64 `args` read the wrong
+ * registers entirely - r8 where rdi belongs - and so did writes through it.
+ */
+function x86ArgumentSlot(index: number): number {
+  // System V: rdi, rsi, rdx, rcx, r8, r9. Microsoft x64: rcx, rdx, r8, r9.
+  const slots =
+    NativeProcess.platform === 'windows' ? [13, 12, 7, 6] : [8, 9, 12, 13, 7, 6];
+  return index < slots.length ? slots[index] : -1;
+}
+
+/**
  * Interceptor — Frida-compatible inline hook API.
  * Now a thin wrapper around C++ NativeInterceptor (trampoline + relocator done in C++).
  */
@@ -42,9 +63,9 @@ export const Interceptor = {
               if (isArm64) {
                 return ctxPtr.add(idx * ptrSize).readPointer();
               } else {
-                const regOffsets = [7, 6, 3, 2, 8, 9];
-                if (idx < regOffsets.length) {
-                  return ctxPtr.add(regOffsets[idx] * ptrSize).readPointer();
+                const slot = x86ArgumentSlot(idx);
+                if (slot >= 0) {
+                  return ctxPtr.add(slot * ptrSize).readPointer();
                 }
                 return new NativePointer(0);
               }
@@ -61,9 +82,9 @@ export const Interceptor = {
               if (isArm64) {
                 ctxPtr.add(idx * ptrSize).writePointer(ptr(value));
               } else {
-                const regOffsets = [7, 6, 3, 2, 8, 9];
-                if (idx < regOffsets.length) {
-                  ctxPtr.add(regOffsets[idx] * ptrSize).writePointer(ptr(value));
+                const slot = x86ArgumentSlot(idx);
+                if (slot >= 0) {
+                  ctxPtr.add(slot * ptrSize).writePointer(ptr(value));
                 }
               }
               return true;

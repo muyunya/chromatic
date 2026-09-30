@@ -1,6 +1,14 @@
 // test_page_access.cc — MemoryAccessMonitor tests
 #include "test_common.h"
 
+#ifdef CHROMATIC_DARWIN
+#include <mach/mach.h>
+#include <mach/vm_region.h>
+#include <sys/mman.h>
+#else
+#include <sys/mman.h>
+#endif
+
 // ════════════════════════════════════════════════════════════════════════
 // MemoryAccessMonitor Tests
 // ════════════════════════════════════════════════════════════════════════
@@ -348,4 +356,70 @@ TEST_F(ChromaticTest, Signal_PageAccess_MultipleMonitors) {
       h2.disable();
     })()
   )"));
+}
+
+
+/// The monitor has to put a page back the way it found it.
+///
+/// On POSIX it never asked what the protection had been - there is no way to read it
+/// back from mprotect - so it assumed read-write and restored that. A read-only page
+/// quietly became writable. Worse, a watched page of code came back non-executable:
+/// the thread that faulted on it re-executes its instruction and faults again, this
+/// time with nothing interested in handling it.
+TEST_F(ChromaticTest, Signal_PageAccess_RestoresOriginalProtection) {
+  SKIP_SIGNAL();
+#ifdef CHROMATIC_DARWIN
+  const size_t pageSize = 4096;
+  void *page = mmap(nullptr, pageSize, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON, -1, 0);
+  ASSERT_NE(page, MAP_FAILED);
+  ASSERT_EQ(mprotect(page, pageSize, PROT_READ), 0);
+
+  const auto protectionOf = [&]() -> int {
+    vm_address_t addr = reinterpret_cast<vm_address_t>(page);
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    if (vm_region_64(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                     reinterpret_cast<vm_region_info_t>(&info), &count,
+                     &object) != KERN_SUCCESS)
+      return -1;
+    return static_cast<int>(info.protection);
+  };
+
+  ASSERT_EQ(protectionOf() & VM_PROT_WRITE, 0)
+      << "setup: the page should start read-only";
+
+  // Count the accesses, so a run in which nothing ever faulted cannot pass quietly:
+  // a page that was never watched keeps its protection and would look correct.
+  ASSERT_TRUE(jsEval(R"(
+    (() => {
+      globalThis.__accesses = 0;
+      globalThis.__watch = MemoryAccessMonitor.enable(
+        [{ address: ptr(')" + ptrHex(page) + R"('), size: 4096 }],
+        (details) => { globalThis.__accesses++; }
+      );
+    })()
+  )"));
+
+  // Touch it: the fault handler runs, restores what it thinks the protection was, and
+  // lets the read through.
+  volatile char sink = *static_cast<volatile char *>(page);
+  (void)sink;
+
+  ASSERT_TRUE(jsEval(R"(
+    (() => {
+      MemoryAccessMonitor.drain();
+      if (globalThis.__accesses < 1)
+        throw new Error('the monitor never reported the access, so this test proves nothing');
+      globalThis.__watch.disable();
+    })()
+  )"));
+
+  EXPECT_EQ(protectionOf() & VM_PROT_WRITE, 0)
+      << "the monitor left the page writable, but it was read-only before";
+
+  munmap(page, pageSize);
+#endif
 }
