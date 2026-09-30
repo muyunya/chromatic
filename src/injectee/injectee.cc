@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -30,6 +31,9 @@ std::unique_ptr<chromatic::script::runtime> g_runtime;
 /// File watcher state
 std::atomic<bool> g_stop_watching{false};
 std::unique_ptr<std::thread> g_watch_thread;
+
+/// Defined below, next to the platform entry points.
+void shutdown_runtime();
 
 std::string read_file(const std::string &path) {
   std::ifstream file(path);
@@ -107,6 +111,10 @@ void injectee_main() {
     g_runtime = std::make_unique<chromatic::script::runtime>();
     g_runtime->reset();
 
+    // Tear down before the library's static destructors run, while the objects
+    // the engine locks are still alive. See shutdown_runtime().
+    std::atexit(shutdown_runtime);
+
     switch (config.mode) {
     case chromatic::injectee::EmbeddedConfigData::Mode::EmbedJs: {
       if (!config.js_content || config.js_content->empty()) {
@@ -182,15 +190,25 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
   return TRUE;
 }
 #else
-__attribute__((constructor)) static void _library_main() {
-  std::thread([]() { injectee_main(); }).detach();
-}
-
-__attribute__((destructor)) static void _library_cleanup() {
+namespace {
+/// Shuts the engine down while the process is still healthy.
+///
+/// This deliberately replaces the old `__attribute__((destructor))` teardown:
+/// by the time library destructors run, the static objects the native subsystems
+/// lock have already been destroyed, so tearing the runtime down there throws out
+/// of a noexcept destructor and turns an ordinary exit into SIGABRT. Registering
+/// the handler as soon as the runtime exists puts it ahead of those destructors,
+/// because atexit handlers run in reverse order of registration.
+void shutdown_runtime() {
   g_stop_watching = true;
   if (g_watch_thread && g_watch_thread->joinable()) {
     g_watch_thread->join();
   }
   g_runtime.reset();
+}
+} // namespace
+
+__attribute__((constructor)) static void _library_main() {
+  std::thread([]() { injectee_main(); }).detach();
 }
 #endif
