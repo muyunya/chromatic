@@ -81,6 +81,22 @@ std::unordered_map<uint64_t, CallbackInfo *> callbacks;
 void callbackHandler(ffi_cif *cif, void *ret, void **args, void *userData) {
   auto *info = static_cast<CallbackInfo *>(userData);
 
+  // Zero the result first, and let nothing escape below.
+  //
+  // libffi calls this from the middle of arbitrary native code, so there is no frame
+  // above it to unwind into: an exception crossing this boundary terminates the
+  // process. Nothing reachable is known to throw here today - the binding coerces a
+  // JS handler's return value to the declared type before it arrives, so the parse
+  // below is handed something numeric even when the handler returns nonsense, and a
+  // check against the previous code confirmed that. This is a guard, not a fix: the
+  // parse does use std::stoi and friends, which throw on anything else, and the cost
+  // of being wrong about reachability is the whole process. Zeroing first also means
+  // a failure leaves the caller with 0 instead of whatever was in the slot.
+  if (ret && info->retType && info->retType->size)
+    std::memset(ret, 0, info->retType->size);
+
+  try {
+
   // Serialize arguments to string vector
   std::vector<std::string> argStrs;
   for (unsigned i = 0; i < cif->nargs; i++) {
@@ -121,6 +137,10 @@ void callbackHandler(ffi_cif *cif, void *ret, void **args, void *userData) {
     // Default: int
     *static_cast<int *>(ret) = std::stoi(result);
   }
+
+  } catch (...) {
+    // The result slot is already zeroed; report 0 rather than dying.
+  }
 }
 
 } // namespace
@@ -133,6 +153,16 @@ std::string NativeFFI::callFunction(std::shared_ptr<NativePointer> address,
                                     const std::vector<std::string> &args,
                                     const std::string &abi) {
   uint64_t funcAddr = address->value();
+
+  // A call that passes fewer arguments than declared would read past the end of the
+  // args vector. Nothing reachable does that today - the typescript layer already
+  // throws for a wrong argument count, and a check against the previous code confirmed
+  // it - so this is a guard rather than a fix: the caller of this function is not the
+  // only thing that could ever grow a new path here.
+  if (args.size() != argTypes.size())
+    throw std::runtime_error(
+        "FFI: " + std::to_string(argTypes.size()) + " argument types but " +
+        std::to_string(args.size()) + " values");
 
   size_t nargs = argTypes.size();
   std::vector<ffi_type *> ffiArgTypes(nargs);
