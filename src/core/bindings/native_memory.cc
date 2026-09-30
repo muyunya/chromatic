@@ -381,7 +381,7 @@ NativeMemory::scanModule(const std::string &moduleName,
   std::vector<std::shared_ptr<ScanMatch>> results;
 
   if (mod->segments.empty()) {
-    // No segment info (Windows / macOS) — the full range is contiguous
+    // No per-region info (Windows) — the full range is contiguous
     auto addr = reinterpret_cast<const uint8_t *>(mod->base->value());
     return bmhScan(addr, static_cast<size_t>(mod->size), pat);
   }

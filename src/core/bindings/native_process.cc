@@ -1,5 +1,6 @@
 #include "native_process.h"
 #include "native_pointer.h"
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -33,83 +34,115 @@ namespace chromatic::js {
 #ifdef CHROMATIC_DARWIN
 namespace {
 
-/// Size in memory of a Mach-O image.
+/// Where a Mach-O image actually lives in memory.
+struct MachoImageLayout {
+  /// Value for ModuleInfo::size: the span of the run of segments that is
+  /// contiguous with the image header, i.e. the mapping the header lives in.
+  int size = 0;
+  /// The pieces that make up the image, for callers that need all of it rather
+  /// than just the header's mapping.
+  std::vector<SegmentInfo> regions;
+};
+
+/// Describes a Mach-O image.
 ///
 /// The old code took the highest `vmaddr + vmsize` over the segments, which is
 /// an *absolute address*, not a length. Truncated into the `int` that
-/// ModuleInfo stores, it wrapped around: anything living at a high address came
-/// out as hundreds of megabytes, and `Memory.scanModule` then walked far past
-/// the module - slow enough to notice, and worse, returning matches that belong
-/// to other libraries.
+/// ModuleInfo stores, it wrapped around: libSystem.B.dylib was reported as 627 MB
+/// instead of 7 KB, and `Memory.scanModule` then walked a 598 MB range that
+/// contained 101 other modules - 923 ms instead of 0 ms, and matches attributed
+/// to the wrong library.
 ///
-/// Neither the highest segment end nor the overall span is usable for an image
-/// in the dyld shared cache: its segments are scattered across the cache, and
-/// its __LINKEDIT describes the whole cache (hundreds of MB) rather than itself.
-/// Measured for libSystem.B.dylib: __TEXT at 0x18e6b5000 (7 KB), __DATA_CONST at
-/// 0x1e87364d8, __LINKEDIT at 0x1fee98000 with vmsize 0x26760000.
+/// A single contiguous size is not enough either, because an image in the dyld
+/// shared cache is scattered across it: measured for libSystem.B.dylib, __TEXT
+/// sits at 0x18e6b5000, __DATA_CONST at 0x1e87364d8 and __AUTH_CONST at
+/// 0x1f06f69a8. So `size` describes the header's mapping, and `regions` lists
+/// every piece that belongs to the image.
 ///
-/// So measure the run of segments that is contiguous with the image header,
-/// which is the mapping the header actually lives in. That is exact for a
-/// normal image (whose segments are laid out back to back) and degrades to the
-/// image's own __TEXT mapping for a shared-cache image.
+/// Two segments are deliberately left out of `regions`:
 ///
-/// __PAGEZERO is skipped: it is an unmapped 4 GB guard region, not part of the
-/// image, and counting it would put the start address at 0.
-uint64_t machoImageSize(const struct mach_header_64 *header) {
+///   * __PAGEZERO, an unmapped 4 GB guard region rather than image content -
+///     including it would put the image's start address at 0;
+/// `slide` is the image's ASLR offset: segment vmaddrs are the link-time
+/// addresses, so every region has to be reported at vmaddr + slide or it points
+/// at unmapped memory.
+///
+///   * a __LINKEDIT that does not sit with the rest of the image. In the shared
+///     cache that segment belongs to the cache, not to the image: libSystem and
+///     libc++abi both report the identical range 0x1fee98000 + 0x26760000
+///     (617 MB). It holds symbol tables and rebase metadata rather than anything
+///     worth pattern-scanning, and scanning it would walk most of the cache. A
+///     __LINKEDIT that does sit with its image is ordinary image content and is
+///     kept.
+MachoImageLayout describeMachoImage(const struct mach_header_64 *header,
+                                    intptr_t slide) {
   struct Segment {
     uint64_t start;
-    uint64_t end;
+    uint64_t size;
+    bool isLinkEdit;
   };
-  constexpr size_t kMaxSegments = 64;
-  Segment segments[kMaxSegments];
-  size_t count = 0;
+
+  std::vector<Segment> segments;
+  segments.reserve(header->ncmds);
 
   auto cmd = reinterpret_cast<const struct load_command *>(header + 1);
   for (uint32_t i = 0; i < header->ncmds; i++) {
     if (cmd->cmd == LC_SEGMENT_64) {
       auto seg = reinterpret_cast<const struct segment_command_64 *>(cmd);
       const bool isPageZero = std::strncmp(seg->segname, "__PAGEZERO", 10) == 0;
-      if (!isPageZero && seg->vmsize > 0 && count < kMaxSegments)
-        segments[count++] = {seg->vmaddr, seg->vmaddr + seg->vmsize};
+      const bool isLinkEdit = std::strncmp(seg->segname, "__LINKEDIT", 10) == 0;
+      if (!isPageZero && seg->vmsize > 0)
+        segments.push_back(
+            {seg->vmaddr + static_cast<uint64_t>(slide), seg->vmsize, isLinkEdit});
     }
     cmd = reinterpret_cast<const struct load_command *>(
         reinterpret_cast<const uint8_t *>(cmd) + cmd->cmdsize);
   }
-  if (count == 0)
-    return 0;
+  if (segments.empty())
+    return {};
 
-  // Segments are usually already ordered; insertion sort keeps this obvious and
-  // the count is tiny.
-  for (size_t i = 1; i < count; i++) {
-    Segment key = segments[i];
-    size_t j = i;
-    while (j > 0 && segments[j - 1].start > key.start) {
-      segments[j] = segments[j - 1];
-      j--;
-    }
-    segments[j] = key;
-  }
+  std::sort(segments.begin(), segments.end(),
+            [](const Segment &a, const Segment &b) { return a.start < b.start; });
 
-  // Grow the run while the next segment starts within a page of where the
-  // previous one ended. 16 KiB covers both arm64 and x86_64 page sizes.
+  // Segments are page aligned, so treat anything within a page as contiguous.
+  // 16 KiB covers both arm64 and x86_64 page sizes.
   constexpr uint64_t kPageMask = 0x3fff;
-  uint64_t end = segments[0].end;
-  for (size_t i = 1; i < count; i++) {
-    if (segments[i].start > ((end + kPageMask) & ~kPageMask))
-      break; // gap: not part of the same mapping
-    if (segments[i].end > end)
-      end = segments[i].end;
+  const auto touches = [](uint64_t end, uint64_t next) {
+    return next <= ((end + kPageMask) & ~kPageMask);
+  };
+  const auto segmentEnd = [](const Segment &s) { return s.start + s.size; };
+
+  // The run starting at the header decides `size`.
+  uint64_t runEnd = segmentEnd(segments[0]);
+  size_t runLength = 1;
+  for (; runLength < segments.size(); runLength++) {
+    if (!touches(runEnd, segments[runLength].start))
+      break;
+    runEnd = std::max(runEnd, segmentEnd(segments[runLength]));
   }
 
-  return end - segments[0].start;
-}
-
-/// ModuleInfo::size is an int, so clamp rather than wrapping a pathological
-/// image into a negative length.
-int machoImageSizeAsInt(const struct mach_header_64 *header) {
-  const uint64_t size = machoImageSize(header);
   constexpr uint64_t kIntMax = 0x7fffffffULL;
-  return static_cast<int>(size > kIntMax ? kIntMax : size);
+  MachoImageLayout layout;
+  layout.size = static_cast<int>(
+      std::min<uint64_t>(runEnd - segments[0].start, kIntMax));
+
+  for (size_t i = 0; i < segments.size(); i++) {
+    const Segment &segment = segments[i];
+    const bool inRun = i < runLength;
+    if (!inRun && segment.isLinkEdit)
+      continue; // the shared cache's, not this image's (see above)
+
+    if (!layout.regions.empty()) {
+      SegmentInfo &last = layout.regions.back();
+      if (touches(last.base + last.size, segment.start)) {
+        last.size = std::max(last.base + last.size, segmentEnd(segment)) - last.base;
+        continue;
+      }
+    }
+    layout.regions.push_back(SegmentInfo{segment.start, segment.size});
+  }
+
+  return layout;
 }
 
 } // namespace
@@ -210,11 +243,14 @@ std::vector<std::shared_ptr<ModuleInfo>> NativeProcess::enumerateModules() {
     if (!imageName || !header)
       continue;
 
-    // Get the size from segments
     int imageSize = 0;
+    std::vector<SegmentInfo> regions;
     if (header->magic == MH_MAGIC_64) {
-      imageSize =
-          machoImageSizeAsInt(reinterpret_cast<const struct mach_header_64 *>(header));
+      auto layout = describeMachoImage(
+          reinterpret_cast<const struct mach_header_64 *>(header),
+          _dyld_get_image_vmaddr_slide(i));
+      imageSize = layout.size;
+      regions = std::move(layout.regions);
     }
 
     std::string fullPath = imageName;
@@ -225,7 +261,7 @@ std::vector<std::shared_ptr<ModuleInfo>> NativeProcess::enumerateModules() {
 
     result.push_back(std::make_shared<ModuleInfo>(ModuleInfo{
         name, std::make_shared<NativePointer>(reinterpret_cast<uint64_t>(header)),
-                      imageSize, fullPath}));
+                      imageSize, fullPath, std::move(regions)}));
   }
 
 #elif defined(CHROMATIC_LINUX) || defined(CHROMATIC_ANDROID)
@@ -480,13 +516,28 @@ NativeProcess::findModuleByAddress(std::shared_ptr<NativePointer> address) {
 
     uint64_t base = reinterpret_cast<uint64_t>(header);
     int imageSize = 0;
+    std::vector<SegmentInfo> regions;
 
     if (header->magic == MH_MAGIC_64) {
-      imageSize = machoImageSizeAsInt(
-          reinterpret_cast<const struct mach_header_64 *>(header));
+      auto layout = describeMachoImage(
+          reinterpret_cast<const struct mach_header_64 *>(header),
+          _dyld_get_image_vmaddr_slide(i));
+      imageSize = layout.size;
+      regions = std::move(layout.regions);
     }
 
-    if (addr >= base && addr < base + static_cast<uint64_t>(imageSize)) {
+    // An image in the shared cache is not one contiguous range, so ask its
+    // regions rather than assuming base + size covers it.
+    const bool contains =
+        !regions.empty()
+            ? std::any_of(regions.begin(), regions.end(),
+                          [addr](const SegmentInfo &region) {
+                            return addr >= region.base &&
+                                   addr < region.base + region.size;
+                          })
+            : (addr >= base && addr < base + static_cast<uint64_t>(imageSize));
+
+    if (contains) {
       const char *imageName = _dyld_get_image_name(i);
       std::string fullPath = imageName ? imageName : "";
       std::string name = fullPath;
@@ -495,7 +546,8 @@ NativeProcess::findModuleByAddress(std::shared_ptr<NativePointer> address) {
         name = name.substr(pos + 1);
 
       return std::make_shared<ModuleInfo>(ModuleInfo{
-          name, std::make_shared<NativePointer>(base), imageSize, fullPath});
+          name, std::make_shared<NativePointer>(base), imageSize, fullPath,
+          std::move(regions)});
     }
   }
   return nullptr;
